@@ -1,0 +1,10 @@
+# ninja log v5
+2	42794	1729301640	/root/pointMLP-pytorch/pointnet2_ops_lib/build/temp.linux-x86_64-cpython-37/pointnet2_ops/_ext-src/src/group_points.o	341752eb67cf9306
+3	42956	1729301640	/root/pointMLP-pytorch/pointnet2_ops_lib/build/temp.linux-x86_64-cpython-37/pointnet2_ops/_ext-src/src/interpolate.o	86ce543494d8330
+4	44791	1729301642	/root/pointMLP-pytorch/pointnet2_ops_lib/build/temp.linux-x86_64-cpython-37/pointnet2_ops/_ext-src/src/sampling.o	dc83ce757a86f483
+0	46210	1729301643	/root/pointMLP-pytorch/pointnet2_ops_lib/build/temp.linux-x86_64-cpython-37/pointnet2_ops/_ext-src/src/ball_query.o	3e426775a05e994c
+1	46235	1729301643	/root/pointMLP-pytorch/pointnet2_ops_lib/build/temp.linux-x86_64-cpython-37/pointnet2_ops/_ext-src/src/bindings.o	22ffb146f41ee713
+1	113869	1729301711	/root/pointMLP-pytorch/pointnet2_ops_lib/build/temp.linux-x86_64-cpython-37/pointnet2_ops/_ext-src/src/ball_query_gpu.o	85b6aa06a63fb924
+3	114164	1729301711	/root/pointMLP-pytorch/pointnet2_ops_lib/build/temp.linux-x86_64-cpython-37/pointnet2_ops/_ext-src/src/group_points_gpu.o	5d5b1cd18166d247
+4	115463	1729301712	/root/pointMLP-pytorch/pointnet2_ops_lib/build/temp.linux-x86_64-cpython-37/pointnet2_ops/_ext-src/src/interpolate_gpu.o	503028d6cf979aef
+4	118407	1729301715	/root/pointMLP-pytorch/pointnet2_ops_lib/build/temp.linux-x86_64-cpython-37/pointnet2_ops/_ext-src/src/sampling_gpu.o	980fee4d71403962
