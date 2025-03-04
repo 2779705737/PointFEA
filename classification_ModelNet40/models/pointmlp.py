@@ -169,6 +169,10 @@ class LocalGrouper(nn.Module):
         # idx = query_ball_point(radius, nsample, xyz, new_xyz)
         grouped_xyz = index_points(xyz, idx)  # [B, npoint, k, 3]
         grouped_points = index_points(points, idx)  # [B, npoint, k, d]
+        #LEM
+        new_points666 = new_points.unsqueeze(2).expand(-1, -1, self.kneighbors, -1)  # [B, npoint, k, d]
+        diff_points = grouped_points - new_points666 # [B, npoint, k, d]
+
 
         if self.use_xyz:
             # Subtract new_points (expanded) from grouped_points to get relative differences
