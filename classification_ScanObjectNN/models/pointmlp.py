@@ -67,7 +67,7 @@ def index_points(points, idx):
 
 
 def farthest_point_sample(xyz, npoint):
-    # 进行最远点采样
+    
     """
     Input:
         xyz: pointcloud data, [B, N, 3]
@@ -91,7 +91,7 @@ def farthest_point_sample(xyz, npoint):
 
 
 def query_ball_point(radius, nsample, xyz, new_xyz):
-    # 球形邻域查询
+    
     """
     Input:
         radius: local region radius
@@ -129,8 +129,7 @@ def knn_point(nsample, xyz, new_xyz):
 
 
 class LocalGrouper(nn.Module):
-    # 局部分组操作
-    # 将每个中心点及其 k 个邻居点的坐标和特征组合成新的特征表示
+    
     def __init__(self, channel, groups, kneighbors, use_xyz=True, normalize="center", **kwargs):
         """
         Give xyz[b,p,3] and fea[b,p,d], return new_xyz[b,g,3] and new_fea[b,g,k,d]
@@ -169,16 +168,10 @@ class LocalGrouper(nn.Module):
         # idx = query_ball_point(radius, nsample, xyz, new_xyz)
         grouped_xyz = index_points(xyz, idx)  # [B, npoint, k, 3]
         grouped_points = index_points(points, idx)  # [B, npoint, k, d]
-        # LEM局部特征增强
+        # LEM
         new_points666 = new_points.unsqueeze(2).expand(-1, -1, self.kneighbors, -1)  # [B, npoint, k, d]
         diff_points = grouped_points - new_points666  # [B, npoint, k, d]
-        # grouped_points = torch.cat((diff_points_xyz, grouped_points), dim=3)  # [B, npoint, k, 2*d]
-
-        # new_points_expanded = new_points.unsqueeze(2)  # [B, npoint, 1, d]
-        # new_points666 = new_points_expanded.expand(-1, -1, k, -1)  # [B, npoint, k, d]
-
-        # diff_points_xyz = grouped_points - new_points666
-        # grouped_points = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
+        
 
         if self.use_xyz:
             # grouped_points = torch.cat([grouped_points, grouped_xyz,diff_points],dim=-1)  # [B, npoint, k, 2d+3]
@@ -191,7 +184,7 @@ class LocalGrouper(nn.Module):
                 mean = mean.unsqueeze(dim=-2)  # [B, npoint, 1, d+3]
             std = torch.std((grouped_points - mean).reshape(B, -1), dim=-1, keepdim=True).unsqueeze(dim=-1).unsqueeze(
                 dim=-1)
-            grouped_points = (grouped_points - mean) / (std + 1e-5)  # 归一化操作
+            grouped_points = (grouped_points - mean) / (std + 1e-5)  
             grouped_points = self.affine_alpha * grouped_points + self.affine_beta  # α ⊙std+β
 
         new_points = torch.cat([grouped_points, new_points.view(B, S, 1, -1).repeat(1, 1, self.kneighbors, 1)], dim=-1)
@@ -213,7 +206,7 @@ class ConvBNReLU1D(nn.Module):
 
 
 class ConvBNReLURes1D(nn.Module):
-    # 具有残差连接的一维卷积、批归一化和激活函数的模块
+    
     def __init__(self, channel, kernel_size=1, groups=1, res_expansion=1.0, bias=True, activation='relu'):
         super(ConvBNReLURes1D, self).__init__()
         self.act = get_activation(activation)
@@ -245,9 +238,7 @@ class ConvBNReLURes1D(nn.Module):
 
 
 class PreExtraction(nn.Module):
-    # 用于对输入的特征进行预处理和特征提取
-    # 使得特征维度与通道维度交换，并将邻域维度拉平，以便进行卷积操作。
-    # 使特征向量在卷积操作中的通道维度对齐
+    
     def __init__(self, channels, out_channels, blocks=1, groups=1, res_expansion=1, bias=True,
                  activation='relu', use_xyz=True):
         """
@@ -279,8 +270,7 @@ class PreExtraction(nn.Module):
 
 
 class PosExtraction(nn.Module):
-    # 从输入张量中提取位置信息
-    # 它由多个卷积块组成，每个卷积块包含一维卷积、批归一化和激活函数，通过堆叠这些卷积块来实现位置信息的提取。
+    
     def __init__(self, channels, blocks=1, groups=1, res_expansion=1, bias=True, activation='relu'):
         """
         input[b,d,g]; output[b,d,g]
@@ -390,13 +380,12 @@ class Model(nn.Module):
             # print("xxxx.shape", x.shape)
 
         # print("x.shape", x.shape)
-        # 转换维度
-        # 这里没动
+        
         xtemp = x.permute(0, 2, 1)
         xtemp = self.patch_transformer[0](xtemp)
         # x = x.permute(0, 2, 1)  # [B, N, D]
         # x = self.attention_block1(x)
-        # 这里应加入！！BN和relu以及mlp
+       
         # xtemp = self.netmlp(xtemp)
 
         x = xtemp.permute(0, 2, 1)
@@ -408,10 +397,10 @@ class Model(nn.Module):
             print("i", i)
             print("xxxx.shape", x.shape)
 
-            # shape是多少
+           
         # print("xtemp.shape######################", xtemp.shape)
 
-        # 这里忘记转换维度了
+       
         x = x.permute(0, 2, 1)  # [B, N, D]
         x = self.attention_block(x)
         # xtemp = self.patch_transformer[1](x)
