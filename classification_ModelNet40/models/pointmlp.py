@@ -68,7 +68,7 @@ def index_points(points, idx):
 
 
 def farthest_point_sample(xyz, npoint):
-    # 进行最远点采样
+    
     """
     Input:
         xyz: pointcloud data, [B, N, 3]
@@ -92,7 +92,7 @@ def farthest_point_sample(xyz, npoint):
 
 
 def query_ball_point(radius, nsample, xyz, new_xyz):
-    # 球形邻域查询
+    
     """
     Input:
         radius: local region radius
@@ -130,8 +130,7 @@ def knn_point(nsample, xyz, new_xyz):
 
 
 class LocalGrouper(nn.Module):
-    # 局部分组操作
-    # 将每个中心点及其 k 个邻居点的坐标和特征组合成新的特征表示
+    
     def __init__(self, channel, groups, kneighbors, use_xyz=False, normalize="center", **kwargs):
         """
         Give xyz[b,p,3] and fea[b,p,d], return new_xyz[b,g,3] and new_fea[b,g,k,d]
@@ -170,22 +169,6 @@ class LocalGrouper(nn.Module):
         # idx = query_ball_point(radius, nsample, xyz, new_xyz)
         grouped_xyz = index_points(xyz, idx)  # [B, npoint, k, 3]
         grouped_points = index_points(points, idx)  # [B, npoint, k, d]
-        # if self.use_xyz:
-        #     # grouped_points = torch.cat([grouped_points, grouped_xyz],dim=-1)  # [B, npoint, k, d+3]
-        #     new_points666 = new_points.unsqueeze(2).expand(-1, -1, self.kneighbors, -1)  # [B, npoint, k, d]
-        #     grouped_points = grouped_points - new_points666  # [B, npoint, k, d]
-        #     # grouped_points = torch.cat([grouped_xyz, diff_points], dim=-1)  # [B, npoint, k, d+3]
-        # if self.normalize is not None:
-        #     # if self.normalize =="center":
-        #     #     mean = torch.mean(grouped_points, dim=2, keepdim=True)
-        #     # if self.normalize =="anchor":
-        #     #     mean = torch.cat([new_points, new_xyz],dim=-1) if self.use_xyz else new_points
-        #     #     mean = mean.unsqueeze(dim=-2)  # [B, npoint, 1, d+3]
-        #     # mean = torch.mean(grouped_points, dim=2, keepdim=True)
-        #     std = torch.std((grouped_points).reshape(B,-1),dim=-1,keepdim=True).unsqueeze(dim=-1).unsqueeze(dim=-1)
-        #     grouped_points = (grouped_points)/(std + 1e-5)#归一化操作
-        #     grouped_points = torch.cat(grouped_points,new_points)
-        #     grouped_points = self.affine_alpha*grouped_points + self.affine_beta#α ⊙std+β
 
         if self.use_xyz:
             # Subtract new_points (expanded) from grouped_points to get relative differences
@@ -203,10 +186,6 @@ class LocalGrouper(nn.Module):
             std = torch.std(grouped_points.view(B, -1), dim=-1, keepdim=True).unsqueeze(-1).unsqueeze(
                -1)  # [B, 1, 1, 1]
             grouped_points = grouped_points / (std + 1e-5)  # Normalize using std
-            # grouped_points = torch.cat(grouped_points, grouped_xyz)
-            # grouped_points = torch.cat([grouped_points, grouped_xyz], dim=-1)
-            #grouped_points = torch.cat([grouped_points, new_points.unsqueeze(2).expand(-1, -1, self.kneighbors, -1)],
-                                      # dim=-1)
 
             # Apply learnable affine transformation (scale and shift)
             grouped_points = self.affine_alpha * grouped_points + self.affine_beta  # α * normalized_points + β
@@ -230,7 +209,7 @@ class ConvBNReLU1D(nn.Module):
 
 
 class ConvBNReLURes1D(nn.Module):
-    # 具有残差连接的一维卷积、批归一化和激活函数的模块
+    
     def __init__(self, channel, kernel_size=1, groups=1, res_expansion=1.0, bias=True, activation='relu'):
         super(ConvBNReLURes1D, self).__init__()
         self.act = get_activation(activation)
@@ -344,9 +323,9 @@ class Model(nn.Module):
         self.patch_transformer.append(ConT(256,16,4))
         
 
-        # 改这里
+        
         self.patch_transformer.append(ConT(64,32,4))
-        # 注意这里的维度
+        
         
         
         last_channel = embed_dim
@@ -387,7 +366,7 @@ class Model(nn.Module):
             nn.Linear(64, self.class_num)
         )
         self.convself = nn.Sequential(
-            # 注意这里！！！
+            # ！！！
             nn.Conv1d(1024, 128, 1),
             nn.BatchNorm1d(128),
             self.act
@@ -419,11 +398,10 @@ class Model(nn.Module):
 
 
         print("x.shape",x.shape)
-        # 转换维度 
-        # 这里没动
+        
         xtemp = x.permute(0, 2, 1)
         xtemp = self.patch_transformer[0](xtemp)
-        # 这里应加入！！BN和relu以及mlp
+        
         # xtemp = self.netmlp(xtemp)
         
         
@@ -437,11 +415,11 @@ class Model(nn.Module):
             print("xxxx.shape",x.shape)        
 
         
-        # shape是多少
+       
         # print("xtemp.shape######################",xtemp.shape)
 
         
-        # 这里忘记转换维度了
+        
         xtemp = self.patch_transformer[1](x)
         # x.shape torch.Size([32, 1024, 64])
         
