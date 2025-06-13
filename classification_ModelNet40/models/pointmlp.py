@@ -1,0 +1,576 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+# from torch import einsum
+from einops import rearrange, repeat
+
+
+from pointnet2_ops import pointnet2_utils
+
+
+def get_activation(activation):
+    if activation.lower() == 'gelu':
+        return nn.GELU()
+    elif activation.lower() == 'rrelu':
+        return nn.RReLU(inplace=True)
+    elif activation.lower() == 'selu':
+        return nn.SELU(inplace=True)
+    elif activation.lower() == 'silu':
+        return nn.SiLU(inplace=True)
+    elif activation.lower() == 'hardswish':
+        return nn.Hardswish(inplace=True)
+    elif activation.lower() == 'leakyrelu':
+        return nn.LeakyReLU(inplace=True)
+    else:
+        return nn.ReLU(inplace=True)
+
+
+def square_distance(src, dst):
+    """
+    Calculate Euclid distance between each two points.
+    src^T * dst = xn * xm + yn * ym + zn * zm；
+    sum(src^2, dim=-1) = xn*xn + yn*yn + zn*zn;
+    sum(dst^2, dim=-1) = xm*xm + ym*ym + zm*zm;
+    dist = (xn - xm)^2 + (yn - ym)^2 + (zn - zm)^2
+         = sum(src**2,dim=-1)+sum(dst**2,dim=-1)-2*src^T*dst
+    Input:
+        src: source points, [B, N, C]
+        dst: target points, [B, M, C]
+    Output:
+        dist: per-point square distance, [B, N, M]
+    """
+    B, N, _ = src.shape
+    _, M, _ = dst.shape
+    dist = -2 * torch.matmul(src, dst.permute(0, 2, 1))
+    dist += torch.sum(src ** 2, -1).view(B, N, 1)
+    dist += torch.sum(dst ** 2, -1).view(B, 1, M)
+    return dist
+
+
+def index_points(points, idx):
+    """
+    Input:
+        points: input points data, [B, N, C]
+        idx: sample index data, [B, S]
+    Return:
+        new_points:, indexed points data, [B, S, C]
+    """
+    device = points.device
+    B = points.shape[0]
+    view_shape = list(idx.shape)
+    view_shape[1:] = [1] * (len(view_shape) - 1)
+    repeat_shape = list(idx.shape)
+    repeat_shape[0] = 1
+    batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
+    new_points = points[batch_indices, idx, :]
+    return new_points
+
+
+def farthest_point_sample(xyz, npoint):
+    
+    """
+    Input:
+        xyz: pointcloud data, [B, N, 3]
+        npoint: number of samples
+    Return:
+        centroids: sampled pointcloud index, [B, npoint]
+    """
+    device = xyz.device
+    B, N, C = xyz.shape
+    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
+    distance = torch.ones(B, N).to(device) * 1e10
+    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
+    batch_indices = torch.arange(B, dtype=torch.long).to(device)
+    for i in range(npoint):
+        centroids[:, i] = farthest
+        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
+        dist = torch.sum((xyz - centroid) ** 2, -1)
+        distance = torch.min(distance, dist)
+        farthest = torch.max(distance, -1)[1]
+    return centroids
+
+
+def query_ball_point(radius, nsample, xyz, new_xyz):
+    
+    """
+    Input:
+        radius: local region radius
+        nsample: max sample number in local region
+        xyz: all points, [B, N, 3]
+        new_xyz: query points, [B, S, 3]
+    Return:
+        group_idx: grouped points index, [B, S, nsample]
+    """
+    device = xyz.device
+    B, N, C = xyz.shape
+    _, S, _ = new_xyz.shape
+    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
+    sqrdists = square_distance(new_xyz, xyz)
+    group_idx[sqrdists > radius ** 2] = N
+    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
+    group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
+    mask = group_idx == N
+    group_idx[mask] = group_first[mask]
+    return group_idx
+
+
+def knn_point(nsample, xyz, new_xyz):
+    """
+    Input:
+        nsample: max sample number in local region
+        xyz: all points, [B, N, C]
+        new_xyz: query points, [B, S, C]
+    Return:
+        group_idx: grouped points index, [B, S, nsample]
+    """
+    sqrdists = square_distance(new_xyz, xyz)
+    _, group_idx = torch.topk(sqrdists, nsample, dim=-1, largest=False, sorted=False)
+    return group_idx
+
+
+class LocalGrouper(nn.Module):
+    
+    def __init__(self, channel, groups, kneighbors, use_xyz=False, normalize="center", **kwargs):
+        """
+        Give xyz[b,p,3] and fea[b,p,d], return new_xyz[b,g,3] and new_fea[b,g,k,d]
+        :param groups: groups number
+        :param kneighbors: k-nerighbors
+        :param kwargs: others
+        """
+        super(LocalGrouper, self).__init__()
+        self.groups = groups
+        self.kneighbors = kneighbors
+        self.use_xyz = use_xyz
+        if normalize is not None:
+            self.normalize = normalize.lower()
+        else:
+            self.normalize = None
+        if self.normalize not in ["center", "anchor"]:
+            print(f"Unrecognized normalize parameter (self.normalize), set to None. Should be one of [center, anchor].")
+            self.normalize = None
+        if self.normalize is not None:
+            add_channel=3 if self.use_xyz else 0
+            self.affine_alpha = nn.Parameter(torch.ones([1,1,1,channel *2 ]))
+            self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1, channel *2 ]))
+
+    def forward(self, xyz, points):
+        B, N, C = xyz.shape
+        S = self.groups
+        xyz = xyz.contiguous()  # xyz [btach, points, xyz]
+
+        # fps_idx = torch.multinomial(torch.linspace(0, N - 1, steps=N).repeat(B, 1).to(xyz.device), num_samples=self.groups, replacement=False).long()
+        # fps_idx = farthest_point_sample(xyz, self.groups).long()
+        fps_idx = pointnet2_utils.furthest_point_sample(xyz, self.groups).long()  # [B, npoint]
+        new_xyz = index_points(xyz, fps_idx)  # [B, npoint, 3]
+        new_points = index_points(points, fps_idx)  # [B, npoint, d]
+
+        idx = knn_point(self.kneighbors, xyz, new_xyz)
+        # idx = query_ball_point(radius, nsample, xyz, new_xyz)
+        grouped_xyz = index_points(xyz, idx)  # [B, npoint, k, 3]
+        grouped_points = index_points(points, idx)  # [B, npoint, k, d]
+        #LFAM
+        new_points666 = new_points.unsqueeze(2).expand(-1, -1, self.kneighbors, -1)  # [B, npoint, k, d]
+        diff_points = grouped_points - new_points666 # [B, npoint, k, d]
+
+
+        if self.use_xyz:
+            # Subtract new_points (expanded) from grouped_points to get relative differences
+            new_points_expanded = new_points.unsqueeze(2).expand(-1, -1, self.kneighbors, -1)  # [B, S, k, d]
+            grouped_points = grouped_points - new_points_expanded  # Relative position of neighbors
+
+            # Normalization step
+        if self.normalize is not None:
+            new_points_expanded = new_points.unsqueeze(2).expand(-1, -1, self.kneighbors, -1)  # [B, S, k, d]
+            diff_points = grouped_points - new_points_expanded  # Relative position of neighbors
+            grouped_points = torch.cat([grouped_points,diff_points ],
+                                       dim=-1)
+
+            # Calculate the standard deviation across points
+            std = torch.std(grouped_points.view(B, -1), dim=-1, keepdim=True).unsqueeze(-1).unsqueeze(
+               -1)  # [B, 1, 1, 1]
+            grouped_points = grouped_points / (std + 1e-5)  # Normalize using std
+
+            # Apply learnable affine transformation (scale and shift)
+            grouped_points = self.affine_alpha * grouped_points + self.affine_beta  # α * normalized_points + β
+
+        # new_points = torch.cat([grouped_points, new_points.view(B, S, 1, -1).repeat(1, 1, self.kneighbors, 1)], dim=-1)
+        return new_xyz, grouped_points
+
+
+class ConvBNReLU1D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=1, bias=True, activation='relu'):
+        super(ConvBNReLU1D, self).__init__()
+        self.act = get_activation(activation)
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, bias=bias),
+            nn.BatchNorm1d(out_channels),
+            self.act
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ConvBNReLURes1D(nn.Module):
+    
+    def __init__(self, channel, kernel_size=1, groups=1, res_expansion=1.0, bias=True, activation='relu'):
+        super(ConvBNReLURes1D, self).__init__()
+        self.act = get_activation(activation)
+        self.net1 = nn.Sequential(
+            nn.Conv1d(in_channels=channel, out_channels=int(channel * res_expansion),
+                      kernel_size=kernel_size, groups=groups, bias=bias),
+            nn.BatchNorm1d(int(channel * res_expansion)),
+            self.act
+        )
+        if groups > 1:
+            self.net2 = nn.Sequential(
+                nn.Conv1d(in_channels=int(channel * res_expansion), out_channels=channel,
+                          kernel_size=kernel_size, groups=groups, bias=bias),
+                nn.BatchNorm1d(channel),
+                self.act,
+                nn.Conv1d(in_channels=channel, out_channels=channel,
+                          kernel_size=kernel_size, bias=bias),
+                nn.BatchNorm1d(channel),
+            )
+        else:
+            self.net2 = nn.Sequential(
+                nn.Conv1d(in_channels=int(channel * res_expansion), out_channels=channel,
+                          kernel_size=kernel_size, bias=bias),
+                nn.BatchNorm1d(channel)
+            )
+
+    def forward(self, x):
+        return self.act(self.net2(self.net1(x)) + x)
+
+
+class PreExtraction(nn.Module):
+    # 特征聚合
+    def __init__(self, channels, out_channels,  blocks=1, groups=1, res_expansion=1, bias=True,
+                 activation='relu', use_xyz=False):
+        """
+        input: [b,g,k,d]: output:[b,d,g]
+        :param channels:
+        :param blocks:
+        """
+        super(PreExtraction, self).__init__()
+        in_channels = 3+2*channels if use_xyz else 2*channels
+        self.transfer = ConvBNReLU1D(in_channels, out_channels, bias=bias, activation=activation)
+        operation = []
+        for _ in range(blocks):
+            operation.append(
+                ConvBNReLURes1D(out_channels, groups=groups, res_expansion=res_expansion,
+                                bias=bias, activation=activation)
+            )
+        self.operation = nn.Sequential(*operation)
+        
+        self.out_transform = nn.Sequential(
+            nn.BatchNorm1d(out_channels),
+            nn.GELU()
+        )
+
+    
+    def forward(self, x):
+        b, n, s, d = x.size()  # torch.Size([32, 512, 32, 6])
+        x = x.permute(0, 1, 3, 2)
+        x = x.reshape(-1, d, s)
+        x = self.transfer(x)
+        batch_size, _, _ = x.size()
+        x = self.operation(x)  # [b, d, k]
+        x = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)
+        
+        
+        # Apply out transformation
+        x = self.out_transform(x)
+        x = x.reshape(b, n, -1).permute(0, 2, 1)
+        return x
+
+
+class PosExtraction(nn.Module):
+    # 特征整合
+    def __init__(self, channels, blocks=1, groups=1, res_expansion=1, bias=True, activation='relu'):
+        """
+        input[b,d,g]; output[b,d,g]
+        :param channels:
+        :param blocks:
+        """
+        super(PosExtraction, self).__init__()
+        operation = []
+        for _ in range(blocks):
+            operation.append(
+                ConvBNReLURes1D(channels, groups=groups, res_expansion=res_expansion, bias=bias, activation=activation)
+            )
+        self.operation = nn.Sequential(*operation)
+
+    def forward(self, x):  # [b, d, g]
+        return self.operation(x)
+
+
+class Model(nn.Module):
+    def __init__(self, points=1024, class_num=40, embed_dim=64, groups=1, res_expansion=1.0,
+                 activation="relu", bias=True, use_xyz=True, normalize="center",
+                 dim_expansion=[2, 2, 2, 2], pre_blocks=[2, 2, 2, 2], pos_blocks=[2, 2, 2, 2],
+                 k_neighbors=[32, 32, 32, 32], reducers=[2, 2, 2, 2], **kwargs):
+        super(Model, self).__init__()
+        self.stages = len(pre_blocks)
+        self.class_num = class_num
+        self.points = points
+        self.embedding = ConvBNReLU1D(3, embed_dim, bias=bias, activation=activation)
+        assert len(pre_blocks) == len(k_neighbors) == len(reducers) == len(pos_blocks) == len(dim_expansion), \
+            "Please check stage number consistent for pre_blocks, pos_blocks k_neighbors, reducers."
+        self.local_grouper_list = nn.ModuleList()
+        self.pre_blocks_list = nn.ModuleList()
+        self.pos_blocks_list = nn.ModuleList()
+        
+        
+        self.patch_transformer = nn.ModuleList()
+        self.patch_transformer.append(ConT(256,16,4))
+        
+
+        
+        self.patch_transformer.append(ConT(64,32,4))
+        
+        
+        
+        last_channel = embed_dim
+        anchor_points = self.points
+        for i in range(len(pre_blocks)):
+            out_channel = last_channel * dim_expansion[i]
+            pre_block_num = pre_blocks[i]
+            pos_block_num = pos_blocks[i]
+            kneighbor = k_neighbors[i]
+            reduce = reducers[i]
+            anchor_points = anchor_points // reduce
+            # append local_grouper_list
+            local_grouper = LocalGrouper(last_channel, anchor_points, kneighbor, use_xyz, normalize)  # [b,g,k,d]
+            self.local_grouper_list.append(local_grouper)
+            # append pre_block_list
+            pre_block_module = PreExtraction(last_channel, out_channel, pre_block_num, groups=groups,
+                                             res_expansion=res_expansion,
+                                             bias=bias, activation=activation, use_xyz=use_xyz)
+            self.pre_blocks_list.append(pre_block_module)
+            # append pos_block_list
+            pos_block_module = PosExtraction(out_channel, pos_block_num, groups=groups,
+                                             res_expansion=res_expansion, bias=bias, activation=activation)
+            self.pos_blocks_list.append(pos_block_module)
+
+            last_channel = out_channel
+
+        self.act = get_activation(activation)
+        self.classifier = nn.Sequential(
+            # nn.Linear(last_channel, 512),
+            nn.Linear(64, 64),
+            # nn.BatchNorm1d(512),
+            # self.act,
+            # nn.Dropout(0.5),
+            # nn.Linear(512, 256),
+            nn.BatchNorm1d(64),
+            self.act,
+            nn.Dropout(0.5),
+            nn.Linear(64, self.class_num)
+        )
+        self.convself = nn.Sequential(
+            # ！！！
+            nn.Conv1d(1024, 128, 1),
+            nn.BatchNorm1d(128),
+            self.act
+        )
+        
+        
+        self.netmlp = nn.Sequential(
+            nn.Conv1d(256, 256,
+                      kernel_size=1),
+            nn.BatchNorm1d(256),
+            self.act
+        )
+
+    def forward(self, x):
+        xyz = x.permute(0, 2, 1)
+        batch_size, _, _ = x.size()
+        x = self.embedding(x)  # B,D,N
+        
+        
+        
+        # for i in range(self.stages):
+        for i in range(2):
+            # Give xyz[b, p, 3] and fea[b, p, d], return new_xyz[b, g, 3] and new_fea[b, g, k, d]
+            xyz, x = self.local_grouper_list[i](xyz, x.permute(0, 2, 1))  # [b,g,3]  [b,g,k,d]
+            x = self.pre_blocks_list[i](x)  # [b,d,g]
+            x = self.pos_blocks_list[i](x)  # [b,d,g]
+            print("i",i)
+            print("xxxx.shape",x.shape)
+
+
+        print("x.shape",x.shape)
+        
+        xtemp = x.permute(0, 2, 1)
+        xtemp = self.patch_transformer[0](xtemp)
+        
+        # xtemp = self.netmlp(xtemp)
+        
+        
+        x = xtemp.permute(0, 2, 1)
+        for i in range(2, 4):
+            # Give xyz[b, p, 3] and fea[b, p, d], return new_xyz[b, g, 3] and new_fea[b, g, k, d]
+            xyz, x = self.local_grouper_list[i](xyz, x.permute(0, 2, 1))  # [b,g,3]  [b,g,k,d]
+            x = self.pre_blocks_list[i](x)  # [b,d,g]
+            x = self.pos_blocks_list[i](x)  # [b,d,g]
+            print("i",i)
+            print("xxxx.shape",x.shape)        
+
+        
+       
+        # print("xtemp.shape######################",xtemp.shape)
+
+        
+        
+        xtemp = self.patch_transformer[1](x)
+        # x.shape torch.Size([32, 1024, 64])
+        
+        # x_temp = x.permute(0, 2, 1)
+        print("xtemp.shape######################",xtemp.shape)
+       
+        x_temp = xtemp
+        x_temp = self.convself(x_temp)
+        x = x_temp.permute(0, 2, 1)
+        
+        
+        
+        
+        x = F.adaptive_max_pool1d(x, 1).squeeze(dim=-1)
+        print("x=====================",x.shape) # 32 256
+        x = self.classifier(x)
+        return x
+
+
+class ConT(nn.Module):
+    '''
+    Content-based Transformer
+    Args:
+        dim (int): Number of input channels.
+        local_size (int): The size of the local feature space.
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
+        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
+        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+    '''
+
+    def __init__(self, dim, local_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., kmeans = False):
+
+        super().__init__()
+        self.dim = dim
+        self.ls = local_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.kmeans = kmeans
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.softmax = nn.Softmax(dim=-1)
+
+
+    def forward(self, x):
+        '''
+        Input: [B, S, D]
+        Return: [B, S, D]
+        '''
+        
+        
+        B, S, D = x.shape
+        nl = S // self.ls
+        qkv = self.qkv(x).reshape(B, S, 3, self.num_heads, D // self.num_heads).permute(2, 0, 3, 1, 4) # [3, B, h, S, d]
+
+        q_pre = qkv[0].reshape(B*self.num_heads, S, D // self.num_heads).permute(0,2,1) # [B*h, d, S]
+        ntimes = int(math.log(nl, 2))
+        q_idx_last = torch.arange(S).cuda().unsqueeze(0).expand(B*self.num_heads, S)
+        
+        # balanced binary clustering
+        for _ in range(ntimes):
+            bh,d,n = q_pre.shape # [B*h*2^n, d, S/2^n]
+            q_pre_new = q_pre.reshape(bh, d, 2, n//2) # [B*h*2^n, d, 2, S/2^n]
+            q_avg = q_pre_new.mean(dim=-1) # [B*h*2^n, d, 2]
+
+            q_avg = torch.nn.functional.normalize(q_avg.permute(0,2,1), dim=-1) 
+            q_norm = torch.nn.functional.normalize(q_pre.permute(0,2,1), dim=-1)
+            print("q_norm:", q_norm.size())
+            print("q_avg:", q_avg.size())
+  
+            q_scores = square_distance(q_norm, q_avg) # [B*h*2^n, S/2^n, 2]
+            q_ratio = (q_scores[:,:,0]+1) / (q_scores[:,:,1]+1) # [B*h*2^n, S/2^n]
+            q_idx = q_ratio.argsort()
+            
+            q_idx_last = q_idx_last.gather(dim=-1, index=q_idx).reshape(bh*2, n//2) # [B*h*2^n, S/2^n]
+            q_idx_new = q_idx.unsqueeze(1).expand(q_pre.size()) # [B*h*2^n, d, S/2^n]
+            q_pre_new = q_pre.gather(dim=-1, index=q_idx_new).reshape(bh, d, 2, n//2) # [B*h*2^n, d, 2, S/(2^(n+1))]
+            q_pre = rearrange(q_pre_new, 'b d c n -> (b c) d n')   # [B*h*2^(n+1), d, S/(2^(n+1))]
+
+        # clustering is performed independently in each head
+        q_idx = q_idx_last.view(B,self.num_heads, S) # [B, h, S]
+        
+        
+        
+        
+        q_idx_rev = q_idx.argsort() # [B, h, S]
+        
+
+        # cluster query, key, value 
+        q_idx = q_idx.unsqueeze(0).unsqueeze(4).expand(qkv.size()) # [3, B, h, S, d]
+        
+        
+        qkv_pre = qkv.gather(dim=-2, index=q_idx) # [3, B, h, S, d]
+        
+        
+        q, k, v  = rearrange(qkv_pre, 'qkv b h (nl ls) d -> qkv (b nl) h ls d', ls=self.ls)
+        
+
+        # MSA
+        attn = (q - k)*self.scale
+        attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+        
+        out =  torch.einsum('bhld, bhld->bhld', attn, v) # [B*(nl), h, ls, d]
+        
+        
+        
+        # merge and reverse
+        out = rearrange(out, '(b nl) h ls d -> b h d (nl ls)', h=self.num_heads, b=B) # [B, h, d, S]
+        q_idx_rev = q_idx_rev.unsqueeze(2).expand(out.size())
+        res = out.gather(dim=-1,index=q_idx_rev).reshape(B,D,S).permute(0,2,1) # [B, S, D]
+
+        res = self.proj(res) # [B, S, D]
+        res = self.proj_drop(res)
+        
+        res = x + res # [B, S, D]
+        
+        return res
+
+
+
+
+def pointMLP(num_classes=40, **kwargs) -> Model:
+    return Model(points=1024, class_num=num_classes, embed_dim=64, groups=1, res_expansion=1.0,
+                   activation="relu", bias=False, use_xyz=False, normalize="anchor",
+                   dim_expansion=[2, 2, 2, 2], pre_blocks=[2, 2, 2, 2], pos_blocks=[2, 2, 2, 2],
+                   k_neighbors=[24,24,24,24], reducers=[2, 2, 2, 2], **kwargs)
+
+
+def pointMLPElite(num_classes=40, **kwargs) -> Model:
+    return Model(points=1024, class_num=num_classes, embed_dim=32, groups=1, res_expansion=0.25,
+                   activation="relu", bias=False, use_xyz=False, normalize="anchor",
+                   dim_expansion=[2, 2, 2, 1], pre_blocks=[1, 1, 2, 1], pos_blocks=[1, 1, 2, 1],
+                   k_neighbors=[24,24,24,24], reducers=[2, 2, 2, 2], **kwargs)
+
+if __name__ == '__main__':
+    data = torch.rand(2, 3, 1024)
+    print("===> testing pointMLP ...")
+    model = pointMLP()
+    out = model(data)
+    print(out.shape)
+
